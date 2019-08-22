@@ -2,10 +2,10 @@ import * as vscode from 'vscode'
 import * as fs from 'fs-extra'
 import * as path from 'path'
 import * as cp from 'child_process'
-import {latexParser} from 'latex-utensils'
+import {latexParser, bibtexParser} from 'latex-utensils'
 
 import {Extension} from './main'
-import { ExternalCommand, getLongestBalancedString } from './utils'
+import {getLongestBalancedString} from './utils'
 
 async function quickPickRootFile(rootFile: string, localRootFile: string): Promise<string | undefined> {
     const pickedRootFile = await vscode.window.showQuickPick([{
@@ -64,10 +64,11 @@ export class Commander {
         }
 
         const configuration = vscode.workspace.getConfiguration('latex-workshop')
-        const externalBuildCommand = configuration.get('latex.external.build.command') as ExternalCommand
-        if (externalBuildCommand.command) {
+        const externalBuildCommand = configuration.get('latex.external.build.command') as string
+        const externalBuildArgs = configuration.get('latex.external.build.args') as string[]
+        if (externalBuildCommand) {
             const pwd = path.dirname(rootFile ? rootFile : vscode.window.activeTextEditor.document.fileName)
-            await this.extension.builder.buildWithExternalCommand(externalBuildCommand, pwd)
+            await this.extension.builder.buildWithExternalCommand(externalBuildCommand, externalBuildArgs, pwd, rootFile)
             return
         }
         if (rootFile === undefined && this.extension.manager.hasTexId(vscode.window.activeTextEditor.document.languageId)) {
@@ -738,11 +739,19 @@ export class Commander {
         this.extension.parser.parse(vscode.window.activeTextEditor.document.getText())
     }
 
-    devParsePEG() {
+    devParseTeX() {
         if (vscode.window.activeTextEditor === undefined) {
             return
         }
         const ast = latexParser.parse(vscode.window.activeTextEditor.document.getText())
+        vscode.workspace.openTextDocument({content: JSON.stringify(ast, null, 2), language: 'json'}).then(doc => vscode.window.showTextDocument(doc))
+    }
+
+    devParseBib() {
+        if (vscode.window.activeTextEditor === undefined) {
+            return
+        }
+        const ast = bibtexParser.parse(vscode.window.activeTextEditor.document.getText())
         vscode.workspace.openTextDocument({content: JSON.stringify(ast, null, 2), language: 'json'}).then(doc => vscode.window.showTextDocument(doc))
     }
 

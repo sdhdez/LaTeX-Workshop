@@ -7,7 +7,6 @@ import * as pdfjsLib from 'pdfjs-dist'
 import {Mutex} from '../lib/await-semaphore'
 
 import {Extension} from '../main'
-import {ExternalCommand} from '../utils'
 
 const maxPrintLine = '10000'
 const texMagicProgramName = 'TeXMagicProgram'
@@ -71,19 +70,19 @@ export class Builder {
         return releaseBuildMutex
     }
 
-    async buildWithExternalCommand(command: ExternalCommand, pwd: string) {
+    async buildWithExternalCommand(command: string, args: string[], pwd: string, rootFile: string | undefined = undefined) {
         if (this.isWaitingForBuildToFinish()) {
             return
         }
         const releaseBuildMutex = await this.preprocess()
         this.extension.logger.displayStatus('sync~spin', 'statusBar.foreground')
-        this.extension.logger.addLogMessage(`Build using the external command: ${command.command} ${command.args ? command.args.join(' '): ''}`)
+        this.extension.logger.addLogMessage(`Build using the external command: ${command} ${args ? args.join(' '): ''}`)
         let wd = pwd
         const ws = vscode.workspace.workspaceFolders
         if (ws && ws.length > 0) {
             wd = ws[0].uri.fsPath
         }
-        this.currentProcess = cp.spawn(command.command, command.args, {cwd: wd})
+        this.currentProcess = cp.spawn(command, args, {cwd: wd})
         const pid = this.currentProcess.pid
         this.extension.logger.addLogMessage(`LaTeX buid process as an external command spawned. PID: ${pid}.`)
 
@@ -126,6 +125,16 @@ export class Builder {
             } else {
                 this.extension.logger.addLogMessage(`Successfully built. PID: ${pid}`)
                 this.extension.logger.displayStatus('check', 'statusBar.foreground', 'Build succeeded.')
+                try {
+                    if (rootFile === undefined) {
+                        this.extension.viewer.refreshExistingViewer()
+                    } else {
+                        this.buildFinished(rootFile)
+                    }
+                } finally {
+                    this.currentProcess = undefined
+                    releaseBuildMutex()
+                }
             }
             this.currentProcess = undefined
             releaseBuildMutex()
@@ -165,7 +174,7 @@ export class Builder {
                 if (!path.isAbsolute(outDir)) {
                     outDir = path.resolve(this.extension.manager.rootDir, outDir)
                 }
-                Object.keys(this.extension.manager.cachedContent).forEach(file => {
+                this.extension.manager.getIncludedTeX().forEach(file => {
                     const relativePath = path.dirname(file.replace(rootDir, '.'))
                     fs.ensureDirSync(path.resolve(outDir, relativePath))
                 })

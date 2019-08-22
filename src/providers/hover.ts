@@ -81,24 +81,18 @@ export class HoverProvider implements vscode.HoverProvider {
                 resolve(new vscode.Hover([md, mdLink]))
                 return
             }
-            if (hovReference && token in this.extension.completer.reference.suggestions) {
-                const refData = this.extension.completer.reference.suggestions[token]
+            const refs = this.extension.completer.reference.getRefDict()
+            if (hovReference && token in refs) {
+                const refData = refs[token]
                 this.provideHoverOnRef(document, position, refData, token)
                 .then( hover => resolve(hover))
                 return
             }
-            if (hovCitation && token in this.extension.completer.citation.citationData) {
+            const cites = this.extension.completer.citation.getEntryDict()
+            if (hovCitation && token in cites) {
                 const range = document.getWordRangeAtPosition(position, /\{.*?\}/)
                 resolve(new vscode.Hover(
-                    this.extension.completer.citation.citationData[token].text,
-                    range
-                ))
-                return
-            }
-            if (hovCitation && token in this.extension.completer.citation.theBibliographyData) {
-                const range = document.getWordRangeAtPosition(position, /\{.*?\}/)
-                resolve(new vscode.Hover(
-                    this.extension.completer.citation.theBibliographyData[token].text,
+                    '```\n' + cites[token].detail + '\n```\n',
                     range
                 ))
                 return
@@ -168,20 +162,31 @@ export class HoverProvider implements vscode.HoverProvider {
         const signatures: string[] = []
         const pkgs: string[] = []
         const tokenWithoutSlash = token.substring(1)
-        Object.keys(this.extension.completer.command.allCommands).forEach( key => {
-            if (key.startsWith(tokenWithoutSlash) && ((key.length === tokenWithoutSlash.length) || (key.charAt(tokenWithoutSlash.length) === '[') || (key.charAt(tokenWithoutSlash.length) === '{'))) {
-                const command = this.extension.completer.command.allCommands[key]
-                if (command.documentation === undefined) {
-                    return
-                }
-                const doc = command.documentation as string
-                const packageName = command.packageName
-                if (packageName && (pkgs.indexOf(packageName) === -1)) {
-                    pkgs.push(packageName)
-                }
-                signatures.push(doc)
+
+        this.extension.manager.getIncludedTeX().forEach(cachedFile => {
+            const cachedCmds = this.extension.manager.cachedContent[cachedFile].element.command
+            if (cachedCmds === undefined) {
+                return
             }
+            cachedCmds.forEach(cmd => {
+                const key = this.extension.completer.command.getCmdName(cmd)
+                if (key.startsWith(tokenWithoutSlash) &&
+                    ((key.length === tokenWithoutSlash.length) ||
+                     (key.charAt(tokenWithoutSlash.length) === '[') ||
+                     (key.charAt(tokenWithoutSlash.length) === '{'))) {
+                    if (cmd.documentation === undefined) {
+                        return
+                    }
+                    const doc = cmd.documentation as string
+                    const packageName = cmd.package
+                    if (packageName && (pkgs.indexOf(packageName) === -1)) {
+                        pkgs.push(packageName)
+                    }
+                    signatures.push(doc)
+                }
+            })
         })
+
         let pkgLink = ''
         if (pkgs.length > 0) {
             pkgLink = '\n\nView documentation for package(s) '
@@ -236,7 +241,7 @@ export class HoverProvider implements vscode.HoverProvider {
                 return this.provideHoverPreviewOnRef(tex, newCommands, refData)
             }
         }
-        const md = '```latex\n' + refData.label + '\n```\n'
+        const md = '```latex\n' + refData.documentation + '\n```\n'
         const refRange = document.getWordRangeAtPosition(position, /\{.*?\}/)
         const refNumberMessage = this.refNumberMessage(refData)
         if (refNumberMessage !== undefined && configuration.get('hover.ref.number.enabled') as boolean) {

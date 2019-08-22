@@ -14,22 +14,47 @@ export interface Suggestion extends vscode.CompletionItem {
 export class Reference {
     extension: Extension
     // Here we use an object instead of an array for de-duplication
-    suggestions: {[id: string]: Suggestion} = {}
+    private suggestions: {[id: string]: Suggestion} = {}
 
     constructor(extension: Extension) {
         this.extension = extension
     }
 
     provide(args: {document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken, context: vscode.CompletionContext}): vscode.CompletionItem[] {
-        // Update the dirty content in active text editor
-        if (vscode.window.activeTextEditor) {
-            const content = vscode.window.activeTextEditor.document.getText()
-            const refs = this.getRefFromNodeArray(latexParser.parse(content).content, content.split('\n'))
-            this.extension.manager.cachedContent[vscode.window.activeTextEditor.document.uri.fsPath].element.reference = refs
+        // Compile the suggestion object to array
+        this.updateAll(args)
+        return Object.keys(this.suggestions).map(key => this.suggestions[key])
+    }
+
+    update(file: string, nodes?: latexParser.Node[], lines?: string[], content?: string) {
+        if (nodes !== undefined && lines !== undefined) {
+            this.extension.manager.cachedContent[file].element.reference = this.getRefFromNodeArray(nodes, lines)
+        } else if (content !== undefined) {
+            this.extension.manager.cachedContent[file].element.reference = this.getRefFromContent(content)
         }
+    }
+
+    getRefDict(): {[key: string]: Suggestion} {
+        if (this.suggestions) {
+            this.updateAll()
+        }
+        return this.suggestions
+    }
+
+    private updateAll(args?: {document: vscode.TextDocument, position: vscode.Position, token: vscode.CancellationToken, context: vscode.CompletionContext}) {
+        // Update the dirty content in active text editor
+        // *** This is done after stop typing for 5 seconds. Defined in `onDidChangeTextDocument` ***
+        // if (vscode.window.activeTextEditor) {
+        //     const content = vscode.window.activeTextEditor.document.getText()
+        //     const refs = this.getRefFromNodeArray(latexParser.parse(content, { timeout: 1000 }).content, content.split('\n'))
+        //     const cache = this.extension.manager.cachedContent[vscode.window.activeTextEditor.document.uri.fsPath]
+        //     if (cache !== undefined) {
+        //         cache.element.reference = refs
+        //     }
+        // }
         // Extract cached references
         const refList: string[] = []
-        Object.keys(this.extension.manager.cachedContent).forEach(cachedFile => {
+        this.extension.manager.getIncludedTeX().forEach(cachedFile => {
             const cachedRefs = this.extension.manager.cachedContent[cachedFile].element.reference
             if (cachedRefs === undefined) {
                 return
@@ -41,7 +66,7 @@ export class Reference {
                 this.suggestions[ref.label] = {...ref,
                     file: cachedFile,
                     position: ref.range.start,
-                    range: args.document.getWordRangeAtPosition(args.position, /[-a-zA-Z0-9_:.]+/),
+                    range: args ? args.document.getWordRangeAtPosition(args.position, /[-a-zA-Z0-9_:.]+/) : undefined,
                 }
                 refList.push(ref.label)
             })
@@ -52,12 +77,6 @@ export class Reference {
                 delete this.suggestions[key]
             }
         })
-        // Compile the suggestion object to array
-        return Object.keys(this.suggestions).map(key => this.suggestions[key])
-    }
-
-    update(file: string, nodes: latexParser.Node[], lines: string[]) {
-        this.extension.manager.cachedContent[file].element.reference = this.getRefFromNodeArray(nodes, lines)
     }
 
     // This function will return all references in a node array, including sub-nodes
@@ -99,6 +118,37 @@ export class Reference {
         }
         if (latexParser.hasContentArray(node)) {
             return this.getRefFromNodeArray(node.content, lines)
+        }
+        return refs
+    }
+
+    private getRefFromContent(content: string) {
+        const refReg = /(?:\\label(?:\[[^[\]{}]*\])?|(?:^|[,\s])label=){([^}]*)}/gm
+        const refs: vscode.CompletionItem[] = []
+        const refList: string[] = []
+        const contentNoEmpty = content.split('\n').filter(para => para !== '').join('\n')
+        while (true) {
+            const result = refReg.exec(content)
+            if (result === null) {
+                break
+            }
+            if (refList.indexOf(result[1]) > -1) {
+                continue
+            }
+            const prevContent = contentNoEmpty.substring(0, contentNoEmpty.substring(0, result.index).lastIndexOf('\n') - 1)
+            const followLength = contentNoEmpty.substring(result.index, contentNoEmpty.length).split('\n', 4).join('\n').length
+            const positionContent = content.substring(0, result.index).split('\n')
+
+            refs.push({
+                label: result[1],
+                kind: vscode.CompletionItemKind.Reference,
+                // One row before, four rows after
+                documentation: contentNoEmpty.substring(prevContent.lastIndexOf('\n') + 1, result.index + followLength),
+                // Here we abuse the definition of range to store the location of the reference definition
+                range: new vscode.Range(positionContent.length - 1, positionContent[positionContent.length - 1].length,
+                                        positionContent.length - 1, positionContent[positionContent.length - 1].length)
+            })
+            refList.push(result[1])
         }
         return refs
     }

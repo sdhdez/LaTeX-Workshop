@@ -7,19 +7,24 @@ import * as utils from '../utils'
 import {latexParser} from 'latex-utensils'
 
 import {Extension} from '../main'
-// import {ReferenceEntry} from '../providers/completer/reference'
+import {Suggestion as CiteEntry} from '../providers/completer/citation'
+import {Suggestion as CmdEntry} from '../providers/completer/command'
 
 interface Content {
     [filepath: string]: { // tex file name
         content: string, // the dirty (under editing) contents
         element: {
             reference?: vscode.CompletionItem[],
-            environment?: vscode.CompletionItem[]
+            environment?: vscode.CompletionItem[],
+            bibitem?: CiteEntry[],
+            command?: CmdEntry[],
+            package?: string[]
         }, // latex elements for completion, e.g., reference defition
         children: { // sub-files, should be tex or plain files
             index: number, // the index of character sub-content is inserted
             file: string // the path to the sub-file
-        }[]
+        }[],
+        bibs: string[]
     }
 }
 
@@ -132,18 +137,22 @@ export class Manager {
     async findRoot(): Promise<string | undefined> {
         this.findWorkspace()
         this.localRootFile = undefined
-        const findMethods = [() => this.findRootFromMagic(), () => this.findRootFromActive(), () => this.findRootInWorkspace()]
+        const findMethods = [
+            () => this.findRootFromMagic(),
+            () => this.findRootFromActive(),
+            () => this.findRootInWorkspace()
+        ]
         for (const method of findMethods) {
             const rootFile = await method()
             if (rootFile === undefined) {
                 continue
             }
             if (this.rootFile !== rootFile) {
-                this.extension.logger.addLogMessage(`Root file changed from: ${this.rootFile}. Find all dependencies.`)
+                this.extension.logger.addLogMessage(`Root file changed from: ${this.rootFile} to ${rootFile}. Find all dependencies.`)
                 this.rootFile = rootFile
                 this.initiateFileWatcher()
                 this.initiateBibWatcher()
-                await this.parseFileAndSubs(this.rootFile) // finish the parsing is required for subsequent refreshes.
+                this.parseFileAndSubs(this.rootFile) // finish the parsing is required for subsequent refreshes.
                 this.extension.structureProvider.refresh()
                 this.extension.structureProvider.update()
             } else {
@@ -238,16 +247,51 @@ export class Manager {
         const rootFilesExcludeGlob = rootFilesExcludePatterns.length > 0 ? '{' + rootFilesExcludePatterns.join(',') + '}' : undefined
         try {
             const files = await vscode.workspace.findFiles(rootFilesIncludeGlob, rootFilesExcludeGlob)
+            const candidates: string[] = []
             for (const file of files) {
                 const content = utils.stripComments(fs.readFileSync(file.fsPath).toString(), '%')
                 const result = content.match(regex)
                 if (result) {
-                    this.extension.logger.addLogMessage(`Found root file from workspace: ${file.fsPath}`)
-                    return file.fsPath
+                    // Can be a root
+                    const children = this.getTeXChildren(file.fsPath, file.fsPath, [], content)
+                    if (vscode.window.activeTextEditor && children.indexOf(vscode.window.activeTextEditor.document.fileName) > -1) {
+                        this.extension.logger.addLogMessage(`Found root file from parent: ${file.fsPath}`)
+                        return file.fsPath
+                    }
+                    // Not including the active file, yet can still be a root candidate
+                    candidates.push(file.fsPath)
                 }
+            }
+            if (candidates.length > 0) {
+                this.extension.logger.addLogMessage(`Found files that might be root, choose the first one: ${candidates}`)
+                return candidates[0]
             }
         } catch (e) {}
         return undefined
+    }
+
+    /* This function returns a string array which holds all imported tex files
+       from the given `file`. If it is undefined, this function traces from the
+       root file, or return empty array if root is undefined */
+    getIncludedTeX(file?: string, includedTeX: string[] = []) {
+        if (file === undefined) {
+            file = this.rootFile
+        }
+        if (file === undefined) {
+            return []
+        }
+        if (!(file in this.extension.manager.cachedContent)) {
+            return []
+        }
+        includedTeX.push(file)
+        for (const child of this.extension.manager.cachedContent[file].children) {
+            if (includedTeX.indexOf(child.file) > -1) {
+                // Already included
+                continue
+            }
+            this.getIncludedTeX(child.file, includedTeX)
+        }
+        return includedTeX
     }
 
     private getDirtyContent(file: string, reload: boolean = false): string {
@@ -261,7 +305,7 @@ export class Manager {
             return this.cachedContent[cachedFile].content
         }
         const fileContent = utils.stripComments(fs.readFileSync(file).toString(), '%')
-        this.cachedContent[file] = {content: fileContent, element: {}, children: []}
+        this.cachedContent[file] = {content: fileContent, element: {}, children: [], bibs: []}
         return fileContent
     }
 
@@ -274,13 +318,14 @@ export class Manager {
        changes, this lazy loading should be fine. */
     async parseFileAndSubs(file: string, onChange: boolean = false) {
         this.extension.logger.addLogMessage(`Parsing ${file}`)
-        if (this.filesWatched.indexOf(file) < 0) {
+        if (this.fileWatcher && this.filesWatched.indexOf(file) < 0) {
             // The file is first time considered by the extension.
             this.fileWatcher.add(file)
             this.filesWatched.push(file)
         }
         const content = this.getDirtyContent(file, onChange)
         this.cachedContent[file].children = []
+        this.cachedContent[file].bibs = []
         this.cachedFullContent = undefined
         this.parseInputFiles(content, file)
         this.parseBibFiles(content, file)
@@ -331,6 +376,47 @@ export class Manager {
         return content
     }
 
+    private getTeXChildren(file: string, baseFile: string, children: string[], content?: string): string[] {
+        if (content === undefined) {
+            content = utils.stripComments(fs.readFileSync(file).toString(), '%')
+        }
+
+        // Update children of current file
+        if (this.cachedContent[file] === undefined) {
+            this.cachedContent[file] = {content, element: {}, bibs: [], children: []}
+            const inputReg = /(?:\\(?:input|InputIfFileExists|include|subfile|(?:(?:sub)?(?:import|inputfrom|includefrom)\*?{([^}]*)}))(?:\[[^[\]{}]*\])?){([^}]*)}/g
+            while (true) {
+                const result = inputReg.exec(content)
+                if (!result) {
+                    break
+                }
+
+                const inputFile = this.parseInputFilePath(result, baseFile)
+
+                if (!inputFile ||
+                    !fs.existsSync(inputFile) ||
+                    path.relative(inputFile, baseFile) === '') {
+                    continue
+                }
+
+                this.cachedContent[file].children.push({
+                    index: result.index,
+                    file: inputFile
+                })
+            }
+        }
+
+        this.cachedContent[file].children.forEach(child => {
+            if (children.indexOf(child.file) > -1) {
+                // Already included
+                return
+            }
+            children.push(child.file)
+            this.getTeXChildren(child.file, baseFile, children)
+        })
+        return children
+    }
+
     private parseInputFiles(content: string, baseFile: string) {
         const inputReg = /(?:\\(?:input|InputIfFileExists|include|subfile|(?:(?:sub)?(?:import|inputfrom|includefrom)\*?{([^}]*)}))(?:\[[^[\]{}]*\])?){([^}]*)}/g
         while (true) {
@@ -352,7 +438,7 @@ export class Manager {
                 file: inputFile
             })
 
-            if (inputFile in this.cachedContent) {
+            if (this.filesWatched.indexOf(inputFile) > -1) {
                 continue
             }
             this.parseFileAndSubs(inputFile)
@@ -366,7 +452,11 @@ export class Manager {
         } else if (regResult[0].startsWith('\\import') || regResult[0].startsWith('\\inputfrom') || regResult[0].startsWith('\\includefrom')) {
             return utils.resolveFile([regResult[1]], regResult[2])
         } else {
-            return utils.resolveFile([path.dirname(baseFile), ...texDirs], regResult[2])
+            if (this.rootFile) {
+                return utils.resolveFile([path.dirname(baseFile), path.dirname(this.rootFile), ...texDirs], regResult[2])
+            } else {
+                return utils.resolveFile([path.dirname(baseFile), ...texDirs], regResult[2])
+            }
         }
     }
 
@@ -381,7 +471,12 @@ export class Manager {
                 return bib.trim()
             })
             for (const bib of bibs) {
-                this.watchBibFile(bib, path.dirname(baseFile))
+                const bibPath = this.resolveBibPath(bib, path.dirname(baseFile))
+                if (bibPath === undefined) {
+                    continue
+                }
+                this.cachedContent[baseFile].bibs.push(bibPath)
+                this.watchBibFile(bibPath)
             }
         }
     }
@@ -444,7 +539,14 @@ export class Manager {
                 return bib.trim()
             })
             for (const bib of bibs) {
-                this.watchBibFile(bib, srcDir)
+                const bibPath = this.resolveBibPath(bib, srcDir)
+                if (bibPath === undefined) {
+                    continue
+                }
+                if (this.rootFile && this.cachedContent[this.rootFile].bibs.indexOf(bibPath) < 0) {
+                    this.cachedContent[this.rootFile].bibs.push(bibPath)
+                }
+                this.watchBibFile(bibPath)
             }
         }
     }
@@ -515,21 +617,21 @@ export class Manager {
         this.fileWatcher.close()
         this.filesWatched = []
         // We also clean the completions from the old project
-        this.extension.completer.command.reset()
-        this.extension.completer.citation.reset()
         this.extension.completer.input.reset()
     }
 
     private onWatchingNewFile(file: string) {
         this.extension.logger.addLogMessage(`Adding ${file} to file watcher.`)
-        if (['.tex', '.bib'].indexOf(path.extname(file)) > -1 ) {
+        if (['.tex', '.bib'].indexOf(path.extname(file)) > -1 &&
+            file.indexOf('expl3-code.tex') < 0) {
             this.updateCompleterOnChange(file)
         }
     }
 
     private onWatchedFileChanged(file: string) {
         // It is possible for either tex or non-tex files in the watcher.
-        if (['.tex', '.bib'].indexOf(path.extname(file)) > -1 ) {
+        if (['.tex', '.bib'].indexOf(path.extname(file)) > -1 &&
+            file.indexOf('expl3-code.tex') < 0) {
             this.parseFileAndSubs(file, true)
             this.updateCompleterOnChange(file)
         }
@@ -557,7 +659,7 @@ export class Manager {
         this.extension.logger.addLogMessage(`Bib file watcher: ${file} deleted.`)
         this.bibWatcher.unwatch(file)
         this.bibsWatched.splice(this.bibsWatched.indexOf(file), 1)
-        this.extension.completer.citation.forgetParsedBibItems(file)
+        this.extension.completer.citation.removeEntriesInFile(file)
     }
 
     private onWatchedFileDeleted(file: string) {
@@ -584,39 +686,55 @@ export class Manager {
         if (!bibChanged && this.localRootFile && configuration.get('latex.rootFile.useSubFile')) {
             this.extension.commander.build(true, this.localRootFile)
         } else {
-            this.extension.commander.build(true, file)
+            this.extension.commander.build(true, this.rootFile)
         }
     }
 
     // This function updates all completers upon tex-file changes.
     private updateCompleterOnChange(file: string) {
-        fs.readFile(file).then(buffer => buffer.toString()).then(content => {
-            const nodes = latexParser.parse(content).content
-            const lines = content.split('\n')
-            this.extension.completer.reference.update(file, nodes, lines)
-            this.extension.completer.environment.update(file, nodes, lines)
-        })
-        this.extension.completer.command.getCommandsTeX(file)
-        this.extension.completer.command.getPackage(file)
-        this.extension.completer.citation.getTheBibliographyTeX(file)
+        fs.readFile(file).then(buffer => buffer.toString()).then(content => this.updateCompleter(file, content))
         this.extension.completer.input.getGraphicsPath(file)
     }
 
-    private watchBibFile(bib: string, rootDir: string) {
+    // This function updates all completers upon tex-file changes, or active file content is changed.
+    updateCompleter(file: string, content: string) {
+        this.extension.completer.citation.update(file, content)
+        try {
+            const nodes = latexParser.parse(content, { timeout: 1000 }).content
+            const lines = content.split('\n')
+            this.extension.completer.reference.update(file, nodes, lines)
+            this.extension.completer.environment.update(file, nodes, lines)
+            this.extension.completer.command.update(file, nodes)
+            this.extension.completer.command.updatePkg(file, nodes)
+        } catch {
+            this.extension.logger.addLogMessage(`Cannot parse ${file}. Fall back to regex-based completion.`)
+            // Do the update with old style.
+            const contentNoComment = utils.stripComments(content, '%')
+            this.extension.completer.reference.update(file, undefined, undefined, contentNoComment)
+            this.extension.completer.environment.update(file, undefined, undefined, contentNoComment)
+            this.extension.completer.command.update(file, undefined, contentNoComment)
+            this.extension.completer.command.updatePkg(file, undefined, contentNoComment)
+        }
+    }
+
+    private resolveBibPath(bib: string, rootDir: string) {
         const bibDirs = vscode.workspace.getConfiguration('latex-workshop').get('latex.bibDirs') as string[]
         const bibPath = utils.resolveFile([rootDir, ...bibDirs], bib, '.bib')
 
         if (!bibPath) {
             this.extension.logger.addLogMessage(`Cannot find .bib file ${bib}`)
-            return
+            return undefined
         }
         this.extension.logger.addLogMessage(`Found .bib file ${bibPath}`)
+        return bibPath
+    }
 
-        if (this.bibsWatched.indexOf(bibPath) < 0) {
+    private watchBibFile(bibPath: string) {
+        if (this.bibWatcher && this.bibsWatched.indexOf(bibPath) < 0) {
             this.extension.logger.addLogMessage(`Adding .bib file ${bibPath} to bib file watcher.`)
             this.bibWatcher.add(bibPath)
             this.bibsWatched.push(bibPath)
-            this.extension.completer.citation.parseBibFile(bibPath, this.rootFile)
+            this.extension.completer.citation.parseBibFile(bibPath)
         }
     }
 
